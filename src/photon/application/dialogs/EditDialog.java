@@ -25,6 +25,7 @@
 package photon.application.dialogs;
 
 import photon.application.MainForm;
+import photon.application.utilities.MainUtils;
 import photon.file.PhotonFile;
 import photon.file.parts.PhotonDot;
 import photon.file.parts.PhotonFileLayer;
@@ -34,11 +35,12 @@ import photon.file.ui.PhotonEditPanel;
 import javax.swing.*;
 import java.awt.*;
 import java.awt.event.*;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Map;
+import java.util.*;
 
 public class EditDialog extends JDialog {
+
+    private static final int MAX_FILL_RADIUS_SQUARED = 15 * 15;
+
     private JPanel contentPane;
     private JButton buttonOK;
     private JButton buttonCancel;
@@ -55,18 +57,45 @@ public class EditDialog extends JDialog {
     private int layerNo;
     private int layerX;
     private int layerY;
-    private HashSet<PhotonDot> dots;
+    private Set<EditDot> dots;
+    private Stack<Set<EditDot>> operations;
+    private Stack<Set<EditDot>> undoneOperations;
 
     private boolean mirrored;
     private PhotonDot cursorDot;
 
     private MouseAdapter currentEditModeHandler;
 
+    private static class EditDot extends PhotonDot {
+        private Color color;
+
+        public EditDot(PhotonDot dot, Color color) {
+            this(dot.x, dot.y, color);
+        }
+
+        public EditDot(int x, int y, Color color) {
+            super(x, y);
+            this.color = color;
+        }
+
+
+        @Override
+        public String toString() {
+            final StringBuilder sb = new StringBuilder("EditDot{");
+            sb.append("x=").append(x);
+            sb.append(", y=").append(y);
+            sb.append(", color=").append(color);
+            sb.append('}');
+            return sb.toString();
+        }
+    }
+
     private class ModePencilHandler extends MouseAdapter {
         PhotonDot lastCell;
 
         @Override
         public void mousePressed(MouseEvent e) {
+            saveState();
             handleCellChange(e);
         }
 
@@ -78,6 +107,9 @@ public class EditDialog extends JDialog {
         @Override
         public void mouseReleased(MouseEvent e) {
             lastCell = null;
+            if (e.getButton() == MouseEvent.BUTTON2) {
+                flood(getPosition(e));
+            }
         }
 
         private void handleCellChange(MouseEvent e) {
@@ -86,30 +118,7 @@ public class EditDialog extends JDialog {
                 if (!currentCell.equals(lastCell)) {
                     if (e.getButton() == MouseEvent.BUTTON1 || e.getButton() == MouseEvent.BUTTON3) {
                         boolean on = e.getButton() == MouseEvent.BUTTON1;
-                        byte original = layer.get(layerY + currentCell.y, layerX + currentCell.x);
-                        boolean isOriginalOn = original != PhotonLayer.OFF;
-                        Color originalColor = getOriginalColor(currentCell);
-
-                        PhotonDot dot = new PhotonDot(layerY + currentCell.y, layerX + currentCell.x);
-
-                        if (dots.contains(dot)) {
-                            dots.remove(dot);
-                        }
-
-                        Color color = originalColor;
-                        if (on) {
-                            if (!isOriginalOn) {
-                                color = Color.cyan;
-                                dots.add(dot);
-                            }
-                        } else {
-                            if (isOriginalOn) {
-                                color = Color.darkGray;
-                                dots.add(dot);
-                            }
-                        }
-
-                        ((PhotonEditPanel) editArea).drawDot(currentCell.x, currentCell.y, layer, color);
+                        editPixel(currentCell, on);
                         editArea.repaint();
 
                     }
@@ -118,20 +127,120 @@ public class EditDialog extends JDialog {
             }
         }
 
+        private void flood(PhotonDot origin) {
+
+            if (origin == null) {
+                return;
+            }
+
+            saveState();
+
+            int count = 0;
+
+            // do we fill or erase?
+            boolean on = !isDotOn(origin);
+
+            int ox = origin.x;
+            int oy = origin.y;
+
+            Stack<PhotonDot> stack = new Stack<>();
+            stack.push(origin);
+
+            while (!stack.empty()) {
+                PhotonDot dot = stack.pop();
+
+                // inside edit view / layer?
+                if (isValid(dot)) {
+
+                    // check for walls
+                    boolean dotOn = isDotOn(dot);
+                    if (dotOn != on) {
+
+                        // lets not flood the whole layer
+                        int dx = dot.x - ox;
+                        int dy = dot.y - oy;
+                        int d = dx * dx + dy * dy;
+
+                        if (d < MAX_FILL_RADIUS_SQUARED) {
+                            editPixel(dot, on);
+                            ++count;
+
+                            stack.push(new PhotonDot(dot.x - 1, dot.y));
+                            stack.push(new PhotonDot(dot.x, dot.y - 1));
+                            stack.push(new PhotonDot(dot.x + 1, dot.y));
+                            stack.push(new PhotonDot(dot.x, dot.y + 1));
+                        }
+                    }
+                }
+            }
+
+            if (count > 0) {
+                editArea.repaint();
+            }
+
+
+        }
+    }
+
+    private void editPixel(PhotonDot cell, boolean on) {
+        byte original = layer.get(layerY + cell.y, layerX + cell.x);
+        boolean isOriginalOn = original != PhotonLayer.OFF;
+        Color originalColor = getOriginalColor(cell);
+
+        EditDot dot = new EditDot(layerY + cell.y, layerX + cell.x, originalColor);
+
+        if (dots.contains(dot)) {
+            dots.remove(dot);
+        }
+
+        if (on) {
+            if (!isOriginalOn) {
+                dot.color = Color.cyan;
+                dots.add(dot);
+            }
+        } else {
+            if (isOriginalOn) {
+                dot.color = Color.darkGray;
+                dots.add(dot);
+            }
+        }
+
+        ((PhotonEditPanel) editArea).drawDot(cell.x, cell.y, layer, dot.color);
     }
 
     ;
 
     private class ModeSwapHandler extends MouseAdapter {
         private PhotonDot pressedDot;
+        private Rectangle rect;
 
         @Override
         public void mousePressed(MouseEvent e) {
+            saveState();
             pressedDot = getPosition(e);
         }
 
         @Override
+        public void mouseDragged(MouseEvent e) {
+            if (pressedDot != null) {
+
+                clearRect();
+
+                PhotonDot currentDot = getPosition(e);
+                int x1 = Integer.min(pressedDot.x, currentDot.x);
+                int x2 = Integer.max(pressedDot.x, currentDot.x);
+                int y1 = Integer.min(pressedDot.y, currentDot.y);
+                int y2 = Integer.max(pressedDot.y, currentDot.y);
+
+                rect = new Rectangle(x1, y1, x2 - x1, y2 - y1);
+                ((PhotonEditPanel) editArea).drawRect(rect, Color.cyan);
+                editArea.repaint();
+            }
+        }
+
+        @Override
         public void mouseReleased(MouseEvent e) {
+            clearRect();
             PhotonDot releasedDot = getPosition(e);
             if (pressedDot != null && releasedDot != null) {
 
@@ -149,12 +258,82 @@ public class EditDialog extends JDialog {
                 }
             }
         }
+
+        private void clearRect() {
+            if (rect != null) {
+                ((PhotonEditPanel) editArea).drawRect(rect, Color.decode("#999999"));
+                rect = null;
+            }
+        }
+
+    }
+
+    ;
+
+    private class ModeRectHandler extends MouseAdapter {
+        private PhotonDot pressedDot;
+        private Rectangle rect;
+
+        @Override
+        public void mousePressed(MouseEvent e) {
+            saveState();
+            pressedDot = getPosition(e);
+        }
+
+        @Override
+        public void mouseDragged(MouseEvent e) {
+            if (pressedDot != null) {
+
+                clearRect();
+
+                PhotonDot currentDot = getPosition(e);
+                int x1 = Integer.min(pressedDot.x, currentDot.x);
+                int x2 = Integer.max(pressedDot.x, currentDot.x);
+                int y1 = Integer.min(pressedDot.y, currentDot.y);
+                int y2 = Integer.max(pressedDot.y, currentDot.y);
+
+                rect = new Rectangle(x1, y1, x2 - x1, y2 - y1);
+                Color color = e.getButton() == MouseEvent.BUTTON1 ? Color.cyan : Color.lightGray;
+                ((PhotonEditPanel) editArea).drawRect(rect, color);
+                editArea.repaint();
+            }
+        }
+
+        private void clearRect() {
+            if (rect != null) {
+                ((PhotonEditPanel) editArea).drawRect(rect, Color.decode("#999999"));
+                rect = null;
+            }
+        }
+
+        @Override
+        public void mouseReleased(MouseEvent e) {
+            clearRect();
+            PhotonDot releasedDot = getPosition(e);
+            if (pressedDot != null && releasedDot != null) {
+
+                boolean on = e.getButton() == MouseEvent.BUTTON1;
+
+                int x1 = Integer.min(pressedDot.x, releasedDot.x);
+                int x2 = Integer.max(pressedDot.x, releasedDot.x);
+                int y1 = Integer.min(pressedDot.y, releasedDot.y);
+                int y2 = Integer.max(pressedDot.y, releasedDot.y);
+
+                for (int x = x1; x <= x2; x++) {
+                    for (int y = y1; y <= y2; y++) {
+                        editPixel(new PhotonDot(x, y), on);
+                    }
+                    editArea.repaint();
+                }
+            }
+        }
     }
 
     ;
 
     private enum EditMode {
-        pencil("Tip: Use left mouse to set and right mouse to unset pixels."),
+        pencil("Tip: Use left mouse to set and right mouse to unset pixels. Using the middle mouse button you can fill or clear areas."),
+        rect("Tip: Use left mouse drag to set and right mouse drag to unset areas."),
         swap("Tip: Use left mouse to toggle pixels. Drag for toggling within rectangle area.");
         String help;
 
@@ -175,7 +354,9 @@ public class EditDialog extends JDialog {
 
         editModeHandlerRegistry = new HashMap<>();
         editModeHandlerRegistry.put(EditMode.pencil, new ModePencilHandler());
+        editModeHandlerRegistry.put(EditMode.rect, new ModeRectHandler());
         editModeHandlerRegistry.put(EditMode.swap, new ModeSwapHandler());
+
 
         $$$setupUI$$$();
 
@@ -215,6 +396,20 @@ public class EditDialog extends JDialog {
             }
         }, KeyStroke.getKeyStroke(KeyEvent.VK_ESCAPE, 0), JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT);
 
+        contentPane.registerKeyboardAction(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                undo();
+            }
+        }, KeyStroke.getKeyStroke(KeyEvent.VK_Z, MainUtils.getSystemDefaultModifierMask()), JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT);
+
+        contentPane.registerKeyboardAction(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                redo();
+            }
+        }, KeyStroke.getKeyStroke(KeyEvent.VK_Z, MainUtils.getSystemDefaultModifierMask() | KeyEvent.SHIFT_DOWN_MASK), JComponent.WHEN_ANCESTOR_OF_FOCUSED_COMPONENT);
+
         setEditMode(EditMode.pencil);
 
         editArea.addMouseMotionListener(new MouseMotionAdapter() {
@@ -223,6 +418,39 @@ public class EditDialog extends JDialog {
                 handleCursor(e);
             }
         });
+    }
+
+    private void saveState() {
+        Set<EditDot> state = new HashSet<>(dots);
+        operations.push(state);
+    }
+
+    private void undo() {
+        if (!operations.empty()) {
+            Set<EditDot> lastState = new HashSet<>(operations.pop());
+            undoneOperations.push(new HashSet<>(dots));
+            dots = new HashSet<>(lastState);
+
+            redraw();
+        }
+    }
+
+    private void redo() {
+        if (!undoneOperations.empty()) {
+            Set<EditDot> nextState = undoneOperations.pop();
+            operations.push(new HashSet<>(dots));
+            dots = new HashSet<>(nextState);
+
+            redraw();
+        }
+    }
+
+    private void redraw() {
+        ((PhotonEditPanel) editArea).drawLayer(layerX, layerY, layer);
+        for (EditDot dot : dots) {
+            ((PhotonEditPanel) editArea).drawDot(dot.y - layerX, dot.x - layerY, layer, dot.color);
+        }
+        editArea.repaint();
     }
 
     private void setEditMode(EditMode newEditMode) {
@@ -248,6 +476,8 @@ public class EditDialog extends JDialog {
             Color original = getColor(cursorDot);
             Color color = original.brighter();
             if (original.equals(Color.black)) {
+                color = Color.lightGray;
+            } else if (original.equals(Color.cyan)) {
                 color = Color.lightGray;
             }
             ((PhotonEditPanel) editArea).drawDot(cursorDot.x, cursorDot.y, layer, color);
@@ -279,8 +509,9 @@ public class EditDialog extends JDialog {
             }
 
         } else {
-            dots.add(dot);
-            return result ? Color.darkGray : Color.cyan;
+            Color color = result ? Color.darkGray : Color.cyan;
+            dots.add(new EditDot(dot, color));
+            return color;
         }
     }
 
@@ -299,6 +530,12 @@ public class EditDialog extends JDialog {
             default:
                 return Color.black;
         }
+    }
+
+    // check if dot is currently on (edited or original)
+    private boolean isDotOn(PhotonDot dot) {
+        Color color = getColor(dot);
+        return !(color.equals(Color.black) || color.equals(Color.darkGray));
     }
 
     private Color getColor(PhotonDot dst) {
@@ -363,6 +600,8 @@ public class EditDialog extends JDialog {
 
     public void setInformation(PhotonFile photonFile, int layerNo, int mouseX, int mouseY) {
         this.dots = new HashSet<>();
+        operations = new Stack<>();
+        undoneOperations = new Stack<>();
         this.layerNo = layerNo;
         this.photonFile = photonFile;
         this.fileLayer = photonFile.getLayer(layerNo);
@@ -385,8 +624,8 @@ public class EditDialog extends JDialog {
 
         ((PhotonEditPanel) editArea).setMirrored(mirrored);
 
-        layerX = indexX - 1;
-        layerY = indexY - 1;
+        layerX = Math.max(0, indexX - 1);
+        layerY = Math.max(0, indexY - 1);
 
         infoText.setText("Showing column " + indexX + " to " + (indexX + 74) + ", in row " + indexY + " to " + (indexY + 44) + ")");
         ((PhotonEditPanel) editArea).drawLayer(layerX, layerY, layer);
@@ -413,6 +652,13 @@ public class EditDialog extends JDialog {
         return null;
     }
 
+    private boolean isValid(PhotonDot dot) {
+        if (dot.x < 0) return false;
+        if (dot.x >= 75) return false;
+        if (dot.y < 0) return false;
+        if (dot.y >= 45) return false;
+        return true;
+    }
 
     /**
      * Method generated by IntelliJ IDEA GUI Designer
@@ -455,6 +701,7 @@ public class EditDialog extends JDialog {
         modeCombo = new JComboBox();
         final DefaultComboBoxModel defaultComboBoxModel1 = new DefaultComboBoxModel();
         defaultComboBoxModel1.addElement("Pencil");
+        defaultComboBoxModel1.addElement("Rect");
         defaultComboBoxModel1.addElement("Swap");
         modeCombo.setModel(defaultComboBoxModel1);
         panel3.add(modeCombo, new com.intellij.uiDesigner.core.GridConstraints(0, 3, 1, 1, com.intellij.uiDesigner.core.GridConstraints.ANCHOR_WEST, com.intellij.uiDesigner.core.GridConstraints.FILL_HORIZONTAL, com.intellij.uiDesigner.core.GridConstraints.SIZEPOLICY_CAN_GROW, com.intellij.uiDesigner.core.GridConstraints.SIZEPOLICY_FIXED, null, null, null, 0, false));
