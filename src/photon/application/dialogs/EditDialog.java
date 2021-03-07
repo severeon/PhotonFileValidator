@@ -64,6 +64,10 @@ public class EditDialog extends JDialog {
     private boolean mirrored;
     private PhotonDot cursorDot;
 
+    private int mouseX;
+    private int mouseY;
+    private boolean inLayerPreview = false;
+
     private MouseAdapter currentEditModeHandler;
 
     private static class EditDot extends PhotonDot {
@@ -113,6 +117,8 @@ public class EditDialog extends JDialog {
         }
 
         private void handleCellChange(MouseEvent e) {
+            if (inLayerPreview) return;
+
             PhotonDot currentCell = getPosition(e);
             if (currentCell != null) {
                 if (!currentCell.equals(lastCell)) {
@@ -128,7 +134,7 @@ public class EditDialog extends JDialog {
         }
 
         private void flood(PhotonDot origin) {
-
+            if (inLayerPreview) return;
             if (origin == null) {
                 return;
             }
@@ -388,39 +394,46 @@ public class EditDialog extends JDialog {
         });
 
         contentPane.setFocusable(true);
-
-        contentPane.addKeyListener(new KeyAdapter() {
+        contentPane.addKeyListener(new KeyListener() {
             private int prevLayerNo;
-            private boolean pressed = false;
+            private boolean debounce = false;
             private Set<EditDot> prevDots;
 
+            public boolean isLeftOrRight(KeyEvent e) {
+                return e.getKeyCode() == KeyEvent.VK_LEFT || e.getKeyCode() == KeyEvent.VK_RIGHT;
+            }
+
+            @Override
+            public void keyTyped(KeyEvent e) {}
 
             @Override
             public void keyPressed(KeyEvent e) {
-                System.out.println(e.getKeyCode());
-                if (e.getKeyCode() == KeyEvent.VK_X) {
+                if (isLeftOrRight(e) && !debounce) {
+                    debounce = true;
+                    prevLayerNo = layerNo;
+                    prevDots = dots;
+                    inLayerPreview = true;
 
-                    if (!pressed) {
-                        pressed = true;
+                    setInformation(photonFile, prevLayerNo + (e.getKeyCode() == KeyEvent.VK_LEFT ? -1 : 1), mouseX, mouseY);
+                }
+            }
 
-                        prevLayerNo = layerNo;
-                        prevDots = dots;
+            @Override
+            public void keyReleased(KeyEvent e) {
+                if (isLeftOrRight(e)) {
+                    debounce = false;
+                    inLayerPreview = false;
 
-                        setInformation(photonFile, prevLayerNo - 1);
-                    } else {
-                        pressed = false;
+                    setInformation(photonFile, prevLayerNo, mouseX, mouseY);
 
-                        setInformation(photonFile, prevLayerNo);
+                    dots = prevDots;
+                    prevDots = null;
 
-                        dots = prevDots;
-                        prevDots = null;
+                    for (PhotonDot dot : dots) {
+                        int dotX = dot.y - layerX;
+                        int dotY = dot.x - layerY;
 
-                        for (PhotonDot dot : dots) {
-                            int dotX = dot.y - layerX;
-                            int dotY = dot.x - layerY;
-
-                            ((PhotonEditPanel) editArea).drawDot(dotX, dotY, layer, Color.CYAN);
-                        }
+                        ((PhotonEditPanel) editArea).drawDot(dotX, dotY, layer, Color.CYAN);
                     }
 
                     editArea.repaint();
@@ -640,6 +653,9 @@ public class EditDialog extends JDialog {
         setInformation(photonFile, layerNo);
 
         mirrored = photonFile.getPhotonFileHeader().isMirrored();
+
+        this.mouseX = mouseX;
+        this.mouseY = mouseY;
 
         int indexX = (mouseX < 38) ? 1 : mouseX - 38;
         int indexY = (mouseY < 23) ? 1 : mouseY - 23;
